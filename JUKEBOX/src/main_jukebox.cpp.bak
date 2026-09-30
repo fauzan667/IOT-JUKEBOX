@@ -1,0 +1,365 @@
+/**
+ * ============================================================================
+ * Proyek: ESP32 Minecraft Jukebox
+ * Sensor: TCS3000 / TCS3200 (S0, S1, S2, S3, OUT, VCC, GND, LED)
+ * Media: LittleFS Internal Flash (Tanpa MicroSD Card, Partisi 2.8 MB)
+ * Output: Bluetooth Speaker (Classic Bluetooth A2DP Source)
+ * Target: YMX-868BT di Port COM3
+ * ============================================================================
+ */
+
+#include <Arduino.h>
+#include <FS.h>
+#include <LittleFS.h>
+#include "BluetoothA2DPSource.h"
+
+// ============================================================================
+// 1. KONFIGURASI PROYEK & NAMA SPEAKER
+// ============================================================================
+
+// Nama Bluetooth Speaker target (Bisa substring / case-insensitive)
+const char* BT_SPEAKER_NAME = "YMX-868BT";
+
+// Set ke 1 untuk menampilkan data RAW sensor di Serial Monitor untuk kalibrasi kaset
+#define CALIBRATION_MODE 0
+
+// ============================================================================
+// 2. PEMETAAN PIN SENSOR TCS3000 / TCS3200 KE ESP32
+// ============================================================================
+#define S0_PIN    14    // Frequency scaling
+#define S1_PIN    27    // Frequency scaling
+#define S2_PIN    26    // Photodiode filter selection
+#define S3_PIN    25    // Photodiode filter selection
+#define OUT_PIN   33    // Frekuensi keluaran sensor (Pulse input)
+#define LED_PIN   32    // Kontrol lampu LED sensor
+
+// Ambang batas durasi pulsa Clear (us) untuk mendeteksi kaset masuk
+const uint32_t DISC_INSERTED_PULSE_THRESHOLD = 95;
+
+// ============================================================================
+// 3. DATABASE WARNA DISK MINECRAFT
+// ============================================================================
+struct DiscColor {
+  const char* trackName;
+  const char* filePath;
+  float normR;
+  float normG;
+  float normB;
+  float tolerance;
+};
+
+const DiscColor discDatabase[] = {
+  {"13",        "/13.mp3",        0.50, 0.42, 0.08, 0.12}, // Kuning Emas
+  {"cat",       "/cat.mp3",       0.20, 0.65, 0.15, 0.12}, // Hijau Terang
+  {"blocks",    "/blocks.mp3",    0.68, 0.22, 0.10, 0.12}, // Oranye / Merah
+  {"chirp",     "/chirp.mp3",     0.65, 0.18, 0.17, 0.12}, // Merah Tua
+  {"far",       "/far.mp3",       0.35, 0.50, 0.15, 0.12}, // Hijau Muda
+  {"mall",      "/mall.mp3",      0.38, 0.22, 0.40, 0.12}, // Ungu
+  {"mellohi",   "/mellohi.mp3",   0.48, 0.22, 0.30, 0.12}, // Pink / Magenta
+  {"stal",      "/stal.mp3",      0.33, 0.33, 0.34, 0.10}, // Hitam
+  {"strad",     "/strad.mp3",     0.38, 0.38, 0.24, 0.10}, // Putih
+  {"ward",      "/ward.mp3",      0.18, 0.52, 0.30, 0.12}, // Hijau Gelap
+  {"11",        "/11.mp3",        0.33, 0.33, 0.34, 0.10}, // Abu Gelap
+  {"wait",      "/wait.mp3",      0.15, 0.35, 0.50, 0.12}, // Biru Laut
+  {"otherside", "/otherside.mp3", 0.12, 0.50, 0.38, 0.12}, // Biru Teal
+  {"pigstep",   "/pigstep.mp3",   0.58, 0.18, 0.24, 0.12}, // Merah Netherite
+  {"relic",     "/relic.mp3",     0.55, 0.32, 0.13, 0.12}  // Cokelat Tembaga
+};
+const size_t NUM_DISCS = sizeof(discDatabase) / sizeof(discDatabase[0]);
+
+// ============================================================================
+// 4. OBJEK GLOBAL & STATUS
+// ============================================================================
+BluetoothA2DPSource a2dp_source;
+File currentTrackFile;
+
+enum SystemState {
+  STATE_WAIT_BLUETOOTH,
+  STATE_IDLE_WAIT_DISC,
+  STATE_PLAYING
+};
+
+SystemState currentState = STATE_WAIT_BLUETOOTH;
+int currentPlayingIndex = -1;
+unsigned long lastSensorReadTime = 0;
+unsigned long lastBtStatusLog = 0;
+unsigned long debounceStartTime = 0;
+bool isDiscPresent = false;
+bool isBtConnected = false;
+
+// ============================================================================
+// 5. CALLBACK BLUETOOTH A2DP
+// ============================================================================
+
+// Callback saat ESP32 menemukan perangkat Bluetooth di sekitarnya
+bool bt_ssid_callback(const char* ssid, esp_bd_addr_t address, int rssi) {
+  char bda_str[18];
+  sprintf(bda_str, "%02X:%02X:%02X:%02X:%02X:%02X",
+          address[0], address[1], address[2], address[3], address[4], address[5]);
+  Serial.printf("[BT SCAN] Ditemukan: \"%s\" [%s] RSSI: %d\n", ssid ? ssid : "(No Name)", bda_str, rssi);
+
+  // Abaikan laptop MSI
+  if (ssid != nullptr && (strcmp(ssid, "MSI") == 0 || strcasecmp(bda_str, "04:EC:D8:68:15:09") == 0)) {
+    return false;
+  }
+
+  // Jika menemukan perangkat Bluetooth lain (speaker custom/TWS/YMX/dll):
+  // LANGSUNG SAMBUNGKAN OTOMATIS!
+  Serial.printf("[BT MATCH] >>> TARGET TERDETEKSI: \"%s\" [%s]! MENGHUBUNGKAN... <<<\n", 
+                (ssid && strlen(ssid) > 0) ? ssid : "TWS Speaker", bda_str);
+  return true;
+}
+
+// Callback saat status koneksi Bluetooth berubah
+void bt_connection_state_callback(esp_a2d_connection_state_t state, void *) {
+  Serial.printf("[BT STATE] Status Koneksi: %s\n", a2dp_source.to_str(state));
+  if (state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
+    isBtConnected = true;
+    currentState = STATE_IDLE_WAIT_DISC;
+    Serial.println("\n**************************************************");
+    Serial.println("  [BT SUCCESS] BERHASIL TERHUBUNG KE SPEAKER!    ");
+    Serial.println("  Jukebox Siap Digunakan. Masukkan Kaset Disc!   ");
+    Serial.println("**************************************************\n");
+  } else if (state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
+    isBtConnected = false;
+    currentState = STATE_WAIT_BLUETOOTH;
+    Serial.println("[BT STATUS] Koneksi terputus. Mencari ulang speaker...");
+  }
+}
+
+// Callback stream audio PCM
+int32_t get_sound_data(Frame *data, int32_t frame_count) {
+  if (currentState != STATE_PLAYING || !currentTrackFile || !currentTrackFile.available()) {
+    memset(data, 0, frame_count * sizeof(Frame));
+    if (currentState == STATE_PLAYING && currentTrackFile && !currentTrackFile.available()) {
+      Serial.println("[AUDIO] Lagu selesai diputar.");
+      currentTrackFile.close();
+      currentState = STATE_IDLE_WAIT_DISC;
+    }
+    return frame_count;
+  }
+
+  size_t bytesToRead = frame_count * sizeof(Frame);
+  size_t bytesRead = currentTrackFile.read((uint8_t*)data, bytesToRead);
+
+  if (bytesRead < bytesToRead) {
+    memset(((uint8_t*)data) + bytesRead, 0, bytesToRead - bytesRead);
+  }
+
+  return frame_count;
+}
+
+// ============================================================================
+// 6. PEMBACAAN SENSOR WARNA TCS3000 / TCS3200
+// ============================================================================
+struct ColorReading {
+  uint32_t pulseR;
+  uint32_t pulseG;
+  uint32_t pulseB;
+  uint32_t pulseClear;
+  float normR;
+  float normG;
+  float normB;
+  bool isDetected;
+};
+
+ColorReading readTCS3000() {
+  ColorReading c = {0, 0, 0, 0, 0.0f, 0.0f, 0.0f, false};
+
+  // 1. Baca Merah (S2=LOW, S3=LOW)
+  digitalWrite(S2_PIN, LOW);
+  digitalWrite(S3_PIN, LOW);
+  delayMicroseconds(100);
+  c.pulseR = pulseIn(OUT_PIN, LOW, 25000);
+
+  // 2. Baca Hijau (S2=HIGH, S3=HIGH)
+  digitalWrite(S2_PIN, HIGH);
+  digitalWrite(S3_PIN, HIGH);
+  delayMicroseconds(100);
+  c.pulseG = pulseIn(OUT_PIN, LOW, 25000);
+
+  // 3. Baca Biru (S2=LOW, S3=HIGH)
+  digitalWrite(S2_PIN, LOW);
+  digitalWrite(S3_PIN, HIGH);
+  delayMicroseconds(100);
+  c.pulseB = pulseIn(OUT_PIN, LOW, 25000);
+
+  // 4. Baca Clear (S2=HIGH, S3=LOW)
+  digitalWrite(S2_PIN, HIGH);
+  digitalWrite(S3_PIN, LOW);
+  delayMicroseconds(100);
+  c.pulseClear = pulseIn(OUT_PIN, LOW, 25000);
+
+  float intR = (c.pulseR > 0) ? (10000.0f / (float)c.pulseR) : 0.0f;
+  float intG = (c.pulseG > 0) ? (10000.0f / (float)c.pulseG) : 0.0f;
+  float intB = (c.pulseB > 0) ? (10000.0f / (float)c.pulseB) : 0.0f;
+
+  float sum = intR + intG + intB;
+  if (sum > 0.001f) {
+    c.normR = intR / sum;
+    c.normG = intG / sum;
+    c.normB = intB / sum;
+  }
+
+  if (c.pulseClear > 0 && c.pulseClear < DISC_INSERTED_PULSE_THRESHOLD) {
+    c.isDetected = true;
+  }
+
+  return c;
+}
+
+int matchDiscColor(float nr, float ng, float nb) {
+  int bestMatch = -1;
+  float minDistance = 999.0f;
+
+  for (size_t i = 0; i < NUM_DISCS; i++) {
+    float dr = nr - discDatabase[i].normR;
+    float dg = ng - discDatabase[i].normG;
+    float db = nb - discDatabase[i].normB;
+    float dist = sqrt(dr * dr + dg * dg + db * db);
+
+    if (dist < discDatabase[i].tolerance && dist < minDistance) {
+      minDistance = dist;
+      bestMatch = i;
+    }
+  }
+  return bestMatch;
+}
+
+void startTrack(int discIndex) {
+  if (discIndex < 0 || discIndex >= (int)NUM_DISCS) return;
+
+  const char* path = discDatabase[discIndex].filePath;
+  Serial.printf("[JUKEBOX] Memutar kaset: %s (%s)\n", discDatabase[discIndex].trackName, path);
+
+  if (currentTrackFile) {
+    currentTrackFile.close();
+  }
+
+  currentTrackFile = LittleFS.open(path, "r");
+  if (!currentTrackFile) {
+    Serial.printf("[ERROR] File %s tidak ditemukan di Flash LittleFS!\n", path);
+    return;
+  }
+
+  currentPlayingIndex = discIndex;
+  currentState = STATE_PLAYING;
+}
+
+void stopTrack() {
+  if (currentState == STATE_PLAYING) {
+    Serial.println("[JUKEBOX] Kaset dicabut. Musik dihentikan.");
+    if (currentTrackFile) {
+      currentTrackFile.close();
+    }
+    currentPlayingIndex = -1;
+    currentState = isBtConnected ? STATE_IDLE_WAIT_DISC : STATE_WAIT_BLUETOOTH;
+  }
+}
+
+// ============================================================================
+// 7. SETUP
+// ============================================================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\n==================================================");
+  Serial.println("  MINECRAFT JUKEBOX ESP32 (TCS3000 / TCS3200)     ");
+  Serial.println("  Target Speaker: YMX-868BT | COM3                ");
+  Serial.println("==================================================");
+
+  // Inisialisasi Pin TCS3000
+  pinMode(S0_PIN, OUTPUT);
+  pinMode(S1_PIN, OUTPUT);
+  pinMode(S2_PIN, OUTPUT);
+  pinMode(S3_PIN, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(OUT_PIN, INPUT);
+
+  digitalWrite(S0_PIN, HIGH);
+  digitalWrite(S1_PIN, LOW); // 20% scale
+  digitalWrite(LED_PIN, HIGH); // Nyalakan LED sensor
+  Serial.println("[OK] Sensor TCS3000 siap.");
+
+  // Inisialisasi LittleFS Flash
+  if (!LittleFS.begin(true)) {
+    Serial.println("[ERROR] Gagal mount LittleFS!");
+  } else {
+    Serial.println("[OK] LittleFS Flash Internal Siap.");
+  }
+
+  // Konfigurasi Fleksibel Bluetooth A2DP Source
+  Serial.println("[BT] Menyiapkan modul Bluetooth...");
+  a2dp_source.set_ssp_enabled(true);              // Aktifkan Secure Simple Pairing
+  a2dp_source.set_pin_code("0000", ESP_BT_PIN_TYPE_FIXED); // PIN default modul YMX-868BT
+  a2dp_source.set_valid_cod_service(0xFFFF);      // Menerima semua tipe COD Bluetooth Speaker
+  a2dp_source.set_auto_reconnect(false);          // Langsung scan tanpa menunggu timeout reconnect
+  a2dp_source.set_ssid_callback(bt_ssid_callback); // Pindai & tampilkan seluruh perangkat sekitar
+  a2dp_source.set_on_connection_state_changed(bt_connection_state_callback);
+  a2dp_source.set_volume(100);
+
+  Serial.println("[BT] Memulai pencarian Bluetooth Speaker (Inquiry Scan)...");
+  a2dp_source.start(BT_SPEAKER_NAME, get_sound_data);
+
+  Serial.println("[READY] Boot selesai. Menunggu pairing Bluetooth...");
+}
+
+// ============================================================================
+// 8. MAIN LOOP
+// ============================================================================
+void loop() {
+  unsigned long now = millis();
+
+  // Log status Bluetooth berkala jika belum terhubung
+  if (!isBtConnected && (now - lastBtStatusLog >= 4000)) {
+    lastBtStatusLog = now;
+    Serial.printf("[BT SCANNING] Sedang mencari speaker \"%s\"... Pastikan speaker dalam mode pairing!\n", BT_SPEAKER_NAME);
+  }
+
+  // Rutinitas pembacaan sensor setiap 100 ms
+  if (now - lastSensorReadTime >= 100) {
+    lastSensorReadTime = now;
+    ColorReading c = readTCS3000();
+
+#if CALIBRATION_MODE
+    Serial.printf("[CALIB] R:%4u G:%4u B:%4u Clear:%4u us | Norm: r=%.2f g=%.2f b=%.2f | Disc: %s\n",
+                  c.pulseR, c.pulseG, c.pulseB, c.pulseClear, c.normR, c.normG, c.normB,
+                  c.isDetected ? "TERDETEKSI" : "KOSONG");
+    return;
+#endif
+
+    if (c.isDetected && !isDiscPresent) {
+      if (debounceStartTime == 0) {
+        debounceStartTime = now;
+      } else if (now - debounceStartTime > 350) {
+        isDiscPresent = true;
+        debounceStartTime = 0;
+        Serial.printf("[SENSOR] Kaset terdeteksi! (Clear Pulse: %u us)\n", c.pulseClear);
+
+        int discMatch = matchDiscColor(c.normR, c.normG, c.normB);
+        if (discMatch >= 0) {
+          Serial.printf("[SENSOR] Disc Dikenali: %s!\n", discDatabase[discMatch].trackName);
+          startTrack(discMatch);
+        } else {
+          Serial.printf("[SENSOR] Disc Tidak Dikenal! (r=%.2f, g=%.2f, b=%.2f)\n", 
+                        c.normR, c.normG, c.normB);
+        }
+      }
+    } 
+    else if (!c.isDetected && isDiscPresent) {
+      if (debounceStartTime == 0) {
+        debounceStartTime = now;
+      } else if (now - debounceStartTime > 250) {
+        isDiscPresent = false;
+        debounceStartTime = 0;
+        Serial.println("[SENSOR] Kaset dicabut dari slot.");
+        stopTrack();
+      }
+    } 
+    else {
+      debounceStartTime = 0;
+    }
+  }
+
+  delay(10);
+}
